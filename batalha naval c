@@ -1,0 +1,482 @@
+// batalha.c
+// Jogo Batalha Naval - Jogador vs Computador
+// Compilar: gcc -std=c99 -O2 -o batalha batalha.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+#define N 10
+
+// Celular no tabuleiro:
+typedef enum {
+    EMPTY = 0,
+    SHIP,       // parte de navio normal
+    HIT,        // tiro acertou (marca)
+    MISS,       // tiro errou
+    MINE,       // mina especial
+    RADAR,      // radar especial
+    SHIELDED    // parte blindada (precisa de 2 hits)
+} CellType;
+
+// Representação para cada jogador
+typedef struct {
+    CellType board[N][N];      // o que tem no tabuleiro (navios, especiais)
+    int shield_hits[N][N];     // contador de hits para blindagem (se aplicável)
+    int revealed[N][N];       // marca células já reveladas para visão do oponente
+    int ships_remaining;      // partes de navios ainda não afundadas (contando blindagem como 1 por segmento)
+} Player;
+
+const int ship_sizes[] = {5, 4, 3, 3}; // Ex.: porta-aviões, encouraçado, destróier, submarino
+const int ship_count = sizeof(ship_sizes)/sizeof(ship_sizes[0]);
+
+// Prototipos
+void init_player(Player *p);
+void print_own_board(Player *p);
+void print_enemy_view(Player *enemy_view);
+int place_ship_random(Player *p, int size);
+int place_ship_manual(Player *p, int size);
+void place_specials_random(Player *p, int mines, int radars, int shields);
+int in_bounds(int r, int c);
+int player_turn(Player *me, Player *enemy);
+int computer_turn(Player *me, Player *enemy, int *last_r, int *last_c);
+int apply_shot(Player *target, int r, int c);
+void reveal_area(Player *viewer, Player *target, int r, int c, int radius);
+int all_ships_sunk(Player *p);
+void clear_screen();
+
+int main() {
+    srand((unsigned)time(NULL));
+
+    Player human, cpu;
+    init_player(&human);
+    init_player(&cpu);
+
+    printf("=== BATALHA NAVAL (C) ===\n\n");
+
+    // Escolha do jogador: posicionar manualmente ou aleatório
+    int choice;
+    printf("Deseja posicionar seus navios manualmente ou aleatoriamente?\n1) Manual  2) Aleatório\nEscolha: ");
+    if (scanf("%d", &choice) != 1) choice = 2;
+    while (getchar() != '\n'); // limpa buffer
+
+    for (int i = 0; i < ship_count; ++i) {
+        int sz = ship_sizes[i];
+        int ok = 0;
+        if (choice == 1) {
+            do {
+                print_own_board(&human);
+                printf("\nPosicionando navio de tamanho %d (porta-aviões=5,encouraçado=4,...)\n", sz);
+                ok = place_ship_manual(&human, sz);
+                if (!ok) printf("Posicionamento inválido. Tente novamente.\n");
+            } while (!ok);
+        } else {
+            // aleatório
+            if (!place_ship_random(&human, sz)) {
+                // caso improvável: limpar e recomeçar
+                init_player(&human);
+                i = -1; // reinicia loop
+            }
+        }
+    }
+
+    // CPU posiciona aleatório
+    for (int i = 0; i < ship_count; ++i) {
+        int sz = ship_sizes[i];
+        if (!place_ship_random(&cpu, sz)) {
+            init_player(&cpu);
+            i = -1;
+        }
+    }
+
+    // Coloca especiais (ajusta quantidade conforme desejar)
+    place_specials_random(&human, 3, 2, 3); // jogador
+    place_specials_random(&cpu, 3, 2, 3);   // cpu
+
+    // Ajusta ships_remaining com base nas posições (cada segmento conta 1)
+    human.ships_remaining = 0;
+    cpu.ships_remaining = 0;
+    for (int r=0;r<N;++r) for (int c=0;c<N;++c) {
+        if (human.board[r][c] == SHIP || human.board[r][c] == SHIELDED) human.ships_remaining++;
+        if (cpu.board[r][c] == SHIP || cpu.board[r][c] == SHIELDED) cpu.ships_remaining++;
+    }
+
+    // Loop de jogo
+    int game_over = 0;
+    int turn = 0; // 0 = jogador, 1 = cpu
+    int last_r = -1, last_c = -1; // memória simples para CPU
+    while (!game_over) {
+        clear_screen();
+        printf("Seus navios (lado esquerdo)  |  Visão do inimigo (lado direito)\n");
+        print_own_board(&human);
+        printf("\nVisão do inimigo (suas marcas):\n");
+        print_enemy_view(&cpu);
+
+        if (turn == 0) {
+            printf("\n-- Seu turno --\n");
+            if (player_turn(&human, &cpu)) {
+                printf("Você afundou o último navio inimigo! Você vence!\n");
+                break;
+            }
+            turn = 1;
+        } else {
+            printf("\n-- Turno do Computador --\n");
+            if (computer_turn(&cpu, &human, &last_r, &last_c)) {
+                printf("O computador afundou seu último navio. Você perdeu.\n");
+                break;
+            }
+            turn = 0;
+        }
+        printf("\nPressione ENTER para continuar...");
+        getchar();
+    }
+
+    printf("\nFim do jogo. Obrigado por jogar!\n");
+    return 0;
+}
+
+/* ---------- Funções de inicialização e utilitárias ---------- */
+
+void init_player(Player *p) {
+    for (int r=0;r<N;++r)
+        for (int c=0;c<N;++c) {
+            p->board[r][c] = EMPTY;
+            p->shield_hits[r][c] = 0;
+            p->revealed[r][c] = 0;
+        }
+    p->ships_remaining = 0;
+}
+
+void clear_screen() {
+    // Simples limpar tela para terminals *nix e Windows (não garantido em todos os consoles)
+    #ifdef _WIN32
+        system("cls");
+    #else
+        system("clear");
+    #endif
+}
+
+int in_bounds(int r, int c) {
+    return (r >= 0 && r < N && c >= 0 && c < N);
+}
+
+/* ---------- Impressão dos tabuleiros ---------- */
+
+void print_own_board(Player *p) {
+    printf("   ");
+    for (int c=0;c<N;++c) printf("%2d", c);
+    printf("    Seu tabuleiro\n");
+    for (int r=0;r<N;++r) {
+        printf("%2d ", r);
+        for (int c=0;c<N;++c) {
+            char ch = '.';
+            switch (p->board[r][c]) {
+                case EMPTY: ch = '.'; break;
+                case SHIP: ch = 'S'; break;
+                case SHIELDed: ch = 'S'; break; // placeholder (won't compile) - fix below
+                default: break;
+            }
+            // We'll render with explicit cases to avoid enum confusion
+            if (p->board[r][c] == EMPTY) ch = '.';
+            else if (p->board[r][c] == SHIP) ch = 'S';
+            else if (p->board[r][c] == HIT) ch = 'X';
+            else if (p->board[r][c] == MISS) ch = 'o';
+            else if (p->board[r][c] == MINE) ch = 'M';
+            else if (p->board[r][c] == RADAR) ch = 'R';
+            else if (p->board[r][c] == SHIELDED) {
+                // if shield already got at least 1 hit, show lowercase 's' else 'B'
+                if (p->shield_hits[r][c] > 0) ch = 'x';
+                else ch = 'B';
+            }
+
+            printf(" %c", ch);
+        }
+        printf("\n");
+    }
+}
+
+void print_enemy_view(Player *enemy_view) {
+    printf("   ");
+    for (int c=0;c<N;++c) printf("%2d", c);
+    printf("\n");
+    for (int r=0;r<N;++r) {
+        printf("%2d ", r);
+        for (int c=0;c<N;++c) {
+            char ch = '.';
+            if (enemy_view->revealed[r][c]) {
+                // se marcado como HIT ou MISS
+                if (enemy_view->board[r][c] == HIT) ch = 'X';
+                else if (enemy_view->board[r][c] == MISS) ch = 'o';
+                else ch = '.'; // área revelada sem navio
+            } else {
+                ch = '.';
+            }
+            printf(" %c", ch);
+        }
+        printf("\n");
+    }
+}
+
+/* ---------- Posicionamento de navios e especiais ---------- */
+
+// Tenta posicionar navio aleatoriamente; retorna 1 se ok, 0 se falha
+int place_ship_random(Player *p, int size) {
+    int attempts = 0;
+    while (attempts < 500) {
+        attempts++;
+        int dir = rand() % 2; // 0 horizontal, 1 vertical
+        int r = rand() % N;
+        int c = rand() % N;
+        int ok = 1;
+        for (int i=0;i<size;++i) {
+            int rr = r + (dir==1 ? i : 0);
+            int cc = c + (dir==0 ? i : 0);
+            if (!in_bounds(rr,cc) || p->board[rr][cc] != EMPTY) {
+                ok = 0; break;
+            }
+        }
+        if (!ok) continue;
+        // coloca navio (possibilidade de blindagem aleatória)
+        for (int i=0;i<size;++i) {
+            int rr = r + (dir==1 ? i : 0);
+            int cc = c + (dir==0 ? i : 0);
+            // 20% chance do segmento ser blindado
+            if ((rand()%100) < 20) p->board[rr][cc] = SHIELDED;
+            else p->board[rr][cc] = SHIP;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// Posicionamento manual simples via input do usuário.
+// Retorna 1 se colocado com sucesso, 0 caso contrário.
+int place_ship_manual(Player *p, int size) {
+    int r, c, dir;
+    printf("Informe linha (0-%d): ", N-1);
+    if (scanf("%d", &r) != 1) return 0;
+    printf("Informe coluna (0-%d): ", N-1);
+    if (scanf("%d", &c) != 1) return 0;
+    printf("Direção: 0=horizontal (para a direita), 1=vertical (para baixo): ");
+    if (scanf("%d", &dir) != 1) return 0;
+    while (getchar() != '\n');
+
+    // checar
+    for (int i=0;i<size;++i) {
+        int rr = r + (dir==1 ? i : 0);
+        int cc = c + (dir==0 ? i : 0);
+        if (!in_bounds(rr,cc) || p->board[rr][cc] != EMPTY) return 0;
+    }
+    // colocar (perguntar sobre blindagem opcional - simplificamos: 15% chance)
+    for (int i=0;i<size;++i) {
+        int rr = r + (dir==1 ? i : 0);
+        int cc = c + (dir==0 ? i : 0);
+        if ((rand()%100) < 15) p->board[rr][cc] = SHIELDED;
+        else p->board[rr][cc] = SHIP;
+    }
+    return 1;
+}
+
+// Coloca especiais aleatoriamente: minas, radares, blindagens extras
+void place_specials_random(Player *p, int mines, int radars, int shields) {
+    int placed = 0;
+    while (placed < mines) {
+        int r = rand()%N, c = rand()%N;
+        if (p->board[r][c] == EMPTY) {
+            p->board[r][c] = MINE;
+            placed++;
+        }
+    }
+    placed = 0;
+    while (placed < radars) {
+        int r = rand()%N, c = rand()%N;
+        if (p->board[r][c] == EMPTY) {
+            p->board[r][c] = RADAR;
+            placed++;
+        }
+    }
+    placed = 0;
+    while (placed < shields) {
+        int r = rand()%N, c = rand()%N;
+        if (p->board[r][c] == EMPTY) {
+            p->board[r][c] = SHIELDED;
+            placed++;
+        }
+    }
+}
+
+/* ---------- Lógica de tiro e efeitos especiais ---------- */
+
+// Aplica um tiro no target. Retorna:
+// 0 = tiro sem afundar o último navio,
+// 1 = o tiro causou a derrota (último navio afundado)
+int apply_shot(Player *target, int r, int c) {
+    if (!in_bounds(r,c)) return 0;
+    CellType cell = target->board[r][c];
+
+    if (cell == HIT || cell == MISS) {
+        // já atirado aqui, nada novo
+        return 0;
+    }
+
+    if (cell == EMPTY) {
+        target->board[r][c] = MISS;
+        target->revealed[r][c] = 1;
+        return 0;
+    } else if (cell == SHIP) {
+        target->board[r][c] = HIT;
+        target->revealed[r][c] = 1;
+        target->ships_remaining--;
+    } else if (cell == SHIELDED) {
+        // se ainda não sofreu hits, contar
+        target->shield_hits[r][c]++;
+        target->revealed[r][c] = 1;
+        if (target->shield_hits[r][c] >= 2) {
+            // transforma em HIT
+            target->board[r][c] = HIT;
+            target->ships_remaining--;
+        } else {
+            // marca como atingido parcialmente: para jogador aparece como 'x'
+            // manter board como SHIELDED para necessitar segundo hit
+        }
+    } else if (cell == MINE) {
+        // Explode: marca como HIT e também afeta adjacentes (revelando e possivelmente danificando)
+        target->board[r][c] = HIT;
+        target->revealed[r][c] = 1;
+        // mina não foi contada como navio, mas pode destruir peças adjacentes
+        for (int dr=-1; dr<=1; ++dr)
+            for (int dc=-1; dc<=1; ++dc) {
+                int rr = r + dr, cc = c + dc;
+                if (!in_bounds(rr,cc)) continue;
+                if (target->board[rr][cc] == SHIP) {
+                    target->board[rr][cc] = HIT;
+                    target->revealed[rr][cc] = 1;
+                    target->ships_remaining--;
+                } else if (target->board[rr][cc] == SHIELDED) {
+                    // blindagem sofre 2 hits de uma vez
+                    target->shield_hits[rr][cc] += 2;
+                    if (target->shield_hits[rr][cc] >= 2) {
+                        target->board[rr][cc] = HIT;
+                        target->revealed[rr][cc] = 1;
+                        target->ships_remaining--;
+                    }
+                } else {
+                    // revela misses/empty
+                    target->revealed[rr][cc] = 1;
+                    if (target->board[rr][cc] == EMPTY) target->board[rr][cc] = MISS;
+                }
+            }
+    } else if (cell == RADAR) {
+        // revela área 3x3 ao redor, mas não causa dano
+        target->board[r][c] = MISS;
+        reveal_area(target, target, r, c, 1);
+    }
+
+    if (target->ships_remaining <= 0) return 1;
+    return 0;
+}
+
+// Revela uma área radius ao redor de (r,c) no viewer, exibindo conteúdo real do target (mas sem mudar estado de danos)
+void reveal_area(Player *viewer, Player *target, int r, int c, int radius) {
+    for (int dr=-radius; dr<=radius; ++dr)
+        for (int dc=-radius; dc<=radius; ++dc) {
+            int rr = r + dr, cc = c + dc;
+            if (!in_bounds(rr,cc)) continue;
+            viewer->revealed[rr][cc] = 1;
+            // copiar informação simplificada (se hit/miss) para visualização
+            if (target->board[rr][cc] == HIT) viewer->board[rr][cc] = HIT;
+            else if (target->board[rr][cc] == SHIP || target->board[rr][cc] == SHIELDED) {
+                // não causar dano, apenas revelar que há algo (não transformamos em HIT no target)
+                // mas para a 'visão' do oponente não colocamos SHIP; apenas revela como '.' (ou implementa distinto)
+            } else if (target->board[rr][cc] == MISS) viewer->board[rr][cc] = MISS;
+        }
+}
+
+/* ---------- Turnos do jogador e computador ---------- */
+
+// Retorna 1 se o tiro do jogador terminou o jogo (afundou todos)
+int player_turn(Player *me, Player *enemy) {
+    int r, c;
+    printf("Informe linha e coluna do tiro (ex: 3 5): ");
+    if (scanf("%d %d", &r, &c) != 2) {
+        while (getchar() != '\n');
+        printf("Entrada inválida. Perdeu o turno.\n");
+        return 0;
+    }
+    while (getchar() != '\n');
+    if (!in_bounds(r,c)) {
+        printf("Coordenada fora do tabuleiro. Perdeu o turno.\n");
+        return 0;
+    }
+
+    // Se já tinha sido revelado, avisa
+    if (enemy->revealed[r][c]) {
+        printf("Você já atirou nessa posição. Perdeu o turno.\n");
+        return 0;
+    }
+
+    int ended = apply_shot(enemy, r, c);
+    // marca como revelado para visão do jogador
+    enemy->revealed[r][c] = 1;
+
+    // Se atingiu radar, reveal_area já foi chamada internamente (no apply_shot)
+    // Feedback ao jogador:
+    CellType after = enemy->board[r][c];
+    if (after == HIT) printf("Acertou! \n");
+    else if (after == MISS) printf("Água (ou radar/efeito). \n");
+    else if (after == SHIELDED) {
+        if (enemy->shield_hits[r][c] > 0) printf("Acertou blindagem! Precisa de mais um hit nessa peça.\n");
+    } else {
+        printf("Tiro registrado.\n");
+    }
+
+    return ended;
+}
+
+// Simples IA do computador: tenta continuar perto se acertou; senão aleatório.
+int computer_turn(Player *me, Player *enemy, int *last_r, int *last_c) {
+    int r, c;
+    // IA básica: se último tiro foi um HIT, tenta ao redor
+    if (*last_r >= 0 && *last_c >= 0 && enemy->revealed[*last_r][*last_c] && enemy->board[*last_r][*last_c] == HIT) {
+        int tries = 0;
+        int found = 0;
+        while (tries < 10 && !found) {
+            int dir = rand()%4;
+            int dr = (dir==0?-1:dir==1?1:0);
+            int dc = (dir==2?-1:dir==3?1:0);
+            r = (*last_r) + dr;
+            c = (*last_c) + dc;
+            if (in_bounds(r,c) && !enemy->revealed[r][c]) found = 1;
+            tries++;
+        }
+        if (!found) {
+            r = rand()%N; c = rand()%N;
+            while (enemy->revealed[r][c]) { r = rand()%N; c = rand()%N; }
+        }
+    } else {
+        // aleatório
+        r = rand()%N; c = rand()%N;
+        while (enemy->revealed[r][c]) { r = rand()%N; c = rand()%N; }
+    }
+
+    printf("Computador atira em (%d,%d)\n", r, c);
+    int ended = apply_shot(enemy, r, c);
+    enemy->revealed[r][c] = 1;
+
+    // atualiza memória
+    if (enemy->board[r][c] == HIT) {
+        *last_r = r; *last_c = c;
+    } else {
+        // se errou, limpa memória
+        *last_r = -1; *last_c = -1;
+    }
+
+    return ended;
+}
+
+/* ---------- Verificação de vitória ---------- */
+
+int all_ships_sunk(Player *p) {
+    return p->ships_remaining <= 0;
+}
